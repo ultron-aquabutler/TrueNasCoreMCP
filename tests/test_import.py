@@ -14,7 +14,7 @@ def test_import_main_package():
     """Test that the main package can be imported"""
     from truenas_mcp_server import TrueNASMCPServer, __version__
     assert TrueNASMCPServer is not None
-    assert __version__ == "3.0.0"
+    assert __version__ == "4.1.1"
 
 
 def test_import_exceptions():
