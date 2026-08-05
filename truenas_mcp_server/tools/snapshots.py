@@ -2,9 +2,72 @@
 Snapshot management tools for TrueNAS
 """
 
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from datetime import datetime
 from .base import BaseTool, tool_handler
+from ..exceptions import TrueNASAPIError
+
+
+def _coerce_creation_timestamp(value: Any) -> Optional[Union[int, float]]:
+    """Normalize TrueNAS snapshot creation timestamps into an epoch (seconds).
+
+    TrueNAS SCALE returns ``properties.creation.parsed`` in BSON extended JSON
+    (e.g. ``{"$date": 1717200000000}``), while TrueNAS CORE historically
+    returned a string ISO timestamp or a numeric epoch. Passing any of these
+    straight into ``datetime.fromtimestamp`` either raises ``TypeError`` (dict)
+    or silently produces a wrong date (string). This helper unwraps the BSON
+    shape into epoch seconds and lets everything else pass through.
+
+    Returns ``None`` if the value is missing or not coercible to a number.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, dict):
+        # BSON extended JSON: {"$date": <epoch_ms or ISO string>}
+        bson_date = value.get("$date")
+        if isinstance(bson_date, (int, float)):
+            # BSON $date is milliseconds since epoch.
+            return int(bson_date) // 1000
+        if isinstance(bson_date, str):
+            # Fall back to parsing the ISO string the server sent us.
+            try:
+                # Python 3.11+: tolerate trailing 'Z'.
+                return int(datetime.fromisoformat(bson_date.replace("Z", "+00:00")).timestamp())
+            except (ValueError, TypeError):
+                return None
+        # Some TrueNAS endpoints nest .parsed inside another dict.
+        nested = value.get("parsed")
+        if nested is not None and nested is not value:
+            return _coerce_creation_timestamp(nested)
+        return None
+    if isinstance(value, str):
+        # ISO 8601 string — common on TrueNAS CORE.
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _parse_snapshot_timestamp(snap: Dict[str, Any]) -> Optional[Union[int, float]]:
+    """Extract the creation timestamp from a raw TrueNAS snapshot dict.
+
+    Walks the known nested shapes (``.properties.creation.parsed``,
+    ``.properties.creation``, ``.creation``) and coerces to an epoch.
+    """
+    props = snap.get("properties") or {}
+    creation = props.get("creation") if isinstance(props, dict) else None
+    if creation is None:
+        creation = snap.get("creation")
+    if isinstance(creation, dict):
+        parsed = creation.get("parsed", creation)
+        if isinstance(parsed, dict):
+            # parsed is itself a BSON dict — coerce recursively.
+            return _coerce_creation_timestamp(parsed)
+        return _coerce_creation_timestamp(parsed)
+    return _coerce_creation_timestamp(creation)
 
 
 class SnapshotTools(BaseTool):
@@ -80,25 +143,40 @@ class SnapshotTools(BaseTool):
             else:
                 ds_name = full_name
                 snap_name = ""
-            
+
+            # TrueNAS SCALE returns properties.creation.parsed in BSON extended
+            # JSON ({"$date": <ms>}); CORE historically returns an ISO string
+            # or a numeric epoch. _parse_snapshot_timestamp normalises all of
+            # those into an epoch (int/float) so we can never pass a dict to
+            # datetime.fromtimestamp and crash the whole listing.
+            created_epoch = _parse_snapshot_timestamp(snap)
+            props = snap.get("properties") or {}
+
             snapshot_info = {
                 "name": full_name,
                 "dataset": ds_name,
                 "snapshot": snap_name,
-                "created": snap.get("properties", {}).get("creation", {}).get("parsed") if snap.get("properties") else None,
-                "referenced": snap.get("properties", {}).get("referenced", {}).get("value") if snap.get("properties") else None,
-                "used": snap.get("properties", {}).get("used", {}).get("value") if snap.get("properties") else None,
+                "created": created_epoch,
+                "referenced": props.get("referenced", {}).get("value") if isinstance(props, dict) else None,
+                "used": props.get("used", {}).get("value") if isinstance(props, dict) else None,
                 "holds": snap.get("holds", [])
             }
-            
-            # Format timestamp if available
-            if snapshot_info["created"]:
-                snapshot_info["created_human"] = datetime.fromtimestamp(snapshot_info["created"]).isoformat()
-            
+
+            # Format timestamp if available. Guard against OSError/ValueError
+            # for edge values (e.g. epoch before 1970) so one bad row can't
+            # take the whole listing down.
+            if created_epoch is not None:
+                try:
+                    snapshot_info["created_human"] = datetime.fromtimestamp(created_epoch).isoformat()
+                except (TypeError, ValueError, OSError):
+                    snapshot_info["created_human"] = None
+
             snapshot_list.append(snapshot_info)
-        
-        # Sort by creation time (newest first)
-        snapshot_list.sort(key=lambda x: x.get("created", 0), reverse=True)
+
+        # Sort by creation time (newest first). 'created' is now guaranteed to
+        # be int/float/None, so the default of 0 sorts unknowns last and the
+        # comparison is well-defined.
+        snapshot_list.sort(key=lambda x: x.get("created") or 0, reverse=True)
         
         # Group by dataset (before pagination for accurate counts)
         by_dataset = {}
@@ -157,21 +235,62 @@ class SnapshotTools(BaseTool):
         
         if properties:
             snapshot_data["properties"] = properties
-        
-        created = await self.client.post("/zfs/snapshot", snapshot_data)
-        
+
+        # TrueNAS SCALE returns a job object ({"job_id": <int>}) on success and
+        # an error dict ({"error": ..., "reason": ...}) on failure. We MUST
+        # inspect the response — passing it through unconditionally is what
+        # caused the data-loss-adjacent bug where the wrapper reported success
+        # even when the snapshot never existed.
+        #
+        # HTTP-level errors (4xx/5xx) are already raised by client.post via
+        # TrueNASAPIError; @tool_handler translates that into success=False.
+        # This block handles the inline-error and missing-job_id shapes.
+        try:
+            response = await self.client.post("/zfs/snapshot", snapshot_data) or {}
+        except TrueNASAPIError:
+            # Let the decorator turn it into a structured failure response.
+            raise
+
+        # Inline error payload? Some TrueNAS endpoints return 200 with an error.
+        if isinstance(response, dict) and (response.get("error") or response.get("errored")):
+            reason = (
+                response.get("reason")
+                or response.get("error")
+                or "TrueNAS API returned an error response without details"
+            )
+            return {
+                "success": False,
+                "error": str(reason),
+                "error_type": "TrueNASAPIError",
+                "details": response,
+            }
+
+        # TrueNAS SCALE returns a job descriptor; the snapshot itself appears
+        # asynchronously once the job completes. Surface the job_id so callers
+        # can poll /core/get_jobs and verify completion.
+        job_id = response.get("job_id") if isinstance(response, dict) else None
         snapshot_full_name = f"{dataset}@{name}"
-        
+
         return {
             "success": True,
-            "message": f"Snapshot '{snapshot_full_name}' created successfully",
+            "message": (
+                f"Snapshot job '{job_id}' accepted for '{snapshot_full_name}'"
+                if job_id is not None
+                else f"Snapshot '{snapshot_full_name}' accepted by TrueNAS"
+            ),
             "snapshot": {
                 "name": snapshot_full_name,
                 "dataset": dataset,
                 "snapshot": name,
                 "recursive": recursive,
-                "created": datetime.now().isoformat()
-            }
+                # IMPORTANT: don't fabricate a 'created' timestamp from
+                # datetime.now() — that's the bug that made cutover-prep
+                # believe it had a backup when it didn't. Callers that need
+                # the actual creation time must re-query list_snapshots.
+                "created": None,
+            },
+            "job_id": job_id,
+            "raw_response": response,
         }
     
     @tool_handler
@@ -422,13 +541,26 @@ class SnapshotTools(BaseTool):
             "allow_empty": True
         }
         
-        created = await self.client.post("/pool/snapshottask", task_data)
-        
+        created = await self.client.post("/pool/snapshottask", task_data) or {}
+
+        # Inline error payload? Some TrueNAS endpoints return 200 with an error
+        # rather than raising on the HTTP layer. Surface it instead of
+        # fabricating success. (HTTP 4xx/5xx already propagate via the
+        # @tool_handler decorator.)
+        if isinstance(created, dict) and (created.get("error") or created.get("errored")):
+            reason = created.get("reason") or created.get("error") or "TrueNAS API error"
+            return {
+                "success": False,
+                "error": str(reason),
+                "error_type": "TrueNASAPIError",
+                "details": created,
+            }
+
         return {
             "success": True,
             "message": f"Snapshot task created for dataset '{dataset}'",
             "task": {
-                "id": created.get("id"),
+                "id": created.get("id") if isinstance(created, dict) else None,
                 "dataset": dataset,
                 "schedule": self._format_schedule(schedule),
                 "retention": f"{retention} {retention_unit}(S)",
