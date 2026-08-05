@@ -16,6 +16,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 from .base import BaseTool, tool_handler
+from ..exceptions import TrueNASAPIError
 
 
 class InstanceTools(BaseTool):
@@ -91,7 +92,29 @@ class InstanceTools(BaseTool):
         """
         await self.ensure_initialized()
 
-        instances = await self.client.get("/virt/instance")
+        # The /virt/instance endpoint was renamed/removed in some TrueNAS SCALE
+        # versions (Ultron probe 2026-08-03: 404 on SCALE 24.10). Surface that
+        # as a structured failure with a clear error_type so callers can
+        # distinguish "TrueNAS doesn't expose this surface" from a wrapper bug,
+        # rather than the generic "Client error (404)" the decorator produces.
+        try:
+            instances = await self.client.get("/virt/instance")
+        except TrueNASAPIError as e:
+            # _handle_error_response wraps 404 as TrueNASAPIError. If the
+            # message mentions 404, treat it as endpoint-not-available rather
+            # than a real API error.
+            if "404" in str(e) or "Not Found" in str(e):
+                return {
+                    "success": False,
+                    "error": (
+                        "TrueNAS API endpoint '/virt/instance' is not available "
+                        "on this TrueNAS version. The Incus/VM surface may have "
+                        "been renamed or removed in this SCALE release."
+                    ),
+                    "error_type": "EndpointNotAvailable",
+                    "details": {"endpoint": "/virt/instance", "upstream": str(e)},
+                }
+            raise
 
         instance_list = []
         for inst in instances:

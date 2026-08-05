@@ -18,21 +18,24 @@ logger = logging.getLogger(__name__)
 def tool_handler(func: Callable) -> Callable:
     """
     Decorator for handling tool execution with consistent error handling and logging
-    
+
     Wraps tool methods to:
     - Log execution start/end
     - Handle exceptions consistently
     - Return standardized responses
+    - Classify exceptions so callers can distinguish wrapper bugs (TypeError,
+      AttributeError, etc.) from TrueNAS API errors (TrueNASError subclasses)
+      and from transport failures (httpx.*).
     """
     @wraps(func)
     async def wrapper(self, *args, **kwargs) -> Dict[str, Any]:
         tool_name = func.__name__
         logger.info(f"Executing tool: {tool_name}")
-        
+
         try:
             # Execute the tool function
             result = await func(self, *args, **kwargs)
-            
+
             # Ensure we have a dict response
             if isinstance(result, ResponseModel):
                 response = result.dict()
@@ -40,26 +43,41 @@ def tool_handler(func: Callable) -> Callable:
                 response = result
             else:
                 response = {"success": True, "data": result}
-            
+
             logger.info(f"Tool {tool_name} completed successfully")
             return response
-            
+
         except TrueNASError as e:
             logger.error(f"Tool {tool_name} failed with TrueNAS error: {e.message}")
             return {
                 "success": False,
                 "error": e.message,
                 "error_type": e.__class__.__name__,
-                "details": e.details
+                "details": e.details,
             }
         except Exception as e:
+            # Classify non-TrueNAS exceptions so triage can tell wrapper bugs
+            # apart from transport errors at a glance. (Improvement suggested
+            # by Ultron 2026-08-03 audit.)
+            exc_class = e.__class__.__name__
+            exc_module = e.__class__.__module__
             logger.exception(f"Tool {tool_name} failed with unexpected error")
+            # Heuristic: TypeError, AttributeError, KeyError, ValueError are
+            # almost always wrapper bugs (the TrueNAS API returned something
+            # the wrapper didn't expect). httpx errors are transport.
+            if exc_class in ("TypeError", "AttributeError", "KeyError", "ValueError"):
+                error_type = "WrapperBug"
+            elif exc_module.startswith("httpx"):
+                error_type = "TransportError"
+            else:
+                error_type = "UnexpectedError"
             return {
                 "success": False,
                 "error": str(e),
-                "error_type": "UnexpectedError"
+                "error_type": error_type,
+                "exception_class": f"{exc_module}.{exc_class}",
             }
-    
+
     return wrapper
 
 
@@ -121,16 +139,36 @@ class BaseTool(ABC):
         """
         pass
     
-    def format_size(self, size_bytes: int) -> str:
+    def format_size(self, size_bytes) -> str:
+        """Format bytes as human-readable size.
+
+        Tolerates the upstream BSON extended JSON wrapper shape
+        (``{"value": "1K", "parsed": 1024}``), bare strings (``"1024"``),
+        and ``None``. Any value that can't be coerced to a non-negative
+        number is returned as ``"unknown"`` rather than raising — one bad
+        record must not take down an entire list_iscsi_targets (etc.).
         """
-        Format bytes as human-readable size
-        
-        Args:
-            size_bytes: Size in bytes
-            
-        Returns:
-            Human-readable size string
-        """
+        # Unwrap BSON extended-JSON shapes before coercing.
+        if isinstance(size_bytes, dict):
+            for key in ("parsed", "rawvalue", "value"):
+                if key in size_bytes:
+                    size_bytes = size_bytes[key]
+                    break
+            else:
+                return "unknown"
+
+        if size_bytes is None:
+            return "unknown"
+        if isinstance(size_bytes, str):
+            # Some TrueNAS endpoints serialise numbers as strings. Try to
+            # parse; fall back to "unknown" on garbage.
+            try:
+                size_bytes = int(size_bytes)
+            except (ValueError, TypeError):
+                return "unknown"
+        if not isinstance(size_bytes, (int, float)) or size_bytes < 0:
+            return "unknown"
+
         for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
             if size_bytes < 1024.0:
                 return f"{size_bytes:.2f} {unit}"

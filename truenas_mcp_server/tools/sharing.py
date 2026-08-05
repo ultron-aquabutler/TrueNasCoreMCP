@@ -423,30 +423,71 @@ class SharingTools(BaseTool):
         for te in target_extents:
             target_id = te.get("target")
             extent_id = te.get("extent")
+            if target_id is None or extent_id is None:
+                # Skip malformed records instead of crashing the whole call.
+                continue
+            # Skip unhashable extent ids (BSON ObjectId dicts); the lookup
+            # below falls back to a linear scan for those.
+            try:
+                hash(extent_id)
+            except TypeError:
+                continue
             if target_id not in target_extent_map:
                 target_extent_map[target_id] = []
             target_extent_map[target_id].append(extent_id)
-        
-        # Build extent lookup
-        extent_map = {e["id"]: e for e in extents}
-        
+
+        # Build extent lookup. Tolerate non-hashable `id` (BSON extended JSON
+        # can wrap ObjectIds as dicts) by falling back to a list scan when
+        # needed.
+        extent_map = {}
+        for e in extents:
+            eid = e.get("id")
+            try:
+                hash(eid)  # catches dict/list BSON wrappers
+                extent_map[eid] = e
+            except TypeError:
+                # Skip unhashable ids; the lookup below will fall through.
+                continue
+
         target_list = []
         for target in targets:
             target_id = target.get("id")
+            # Resolve extents for this target — accept either hashable ids or
+            # fall back to linear scan against the unhashable-id extents.
             extent_ids = target_extent_map.get(target_id, [])
-            
+            if not extent_ids and any(not isinstance(e.get("id"), (str, int)) for e in extents):
+                extent_ids = [
+                    te.get("extent") for te in target_extents
+                    if te.get("target") == target_id and te.get("extent") is not None
+                ]
+
             target_extents_info = []
             for extent_id in extent_ids:
-                if extent_id in extent_map:
-                    extent = extent_map[extent_id]
-                    target_extents_info.append({
-                        "id": extent["id"],
-                        "name": extent.get("name"),
-                        "type": extent.get("type"),
-                        "path": extent.get("path") or extent.get("disk"),
-                        "filesize": self.format_size(extent.get("filesize", 0)) if extent.get("filesize") else None,
-                        "enabled": extent.get("enabled", True)
-                    })
+                extent = None
+                try:
+                    extent = extent_map.get(extent_id)
+                except TypeError:
+                    # Should not happen (filter above) but be safe.
+                    extent = None
+                if extent is None:
+                    # Last-chance scan for extents whose id wasn't hashable.
+                    extent = next(
+                        (e for e in extents if e.get("id") == extent_id),
+                        None,
+                    )
+                if extent is None:
+                    continue
+                raw_filesize = extent.get("filesize")
+                target_extents_info.append({
+                    "id": extent.get("id"),
+                    "name": extent.get("name"),
+                    "type": extent.get("type"),
+                    "path": extent.get("path") or extent.get("disk"),
+                    # format_size is now defensive (returns "unknown" on
+                    # unparseable input rather than raising TypeError).
+                    "filesize": self.format_size(raw_filesize) if raw_filesize is not None else None,
+                    "enabled": extent.get("enabled", True)
+                })
             
             target_info = {
                 "id": target.get("id"),

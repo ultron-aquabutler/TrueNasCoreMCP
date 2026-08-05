@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.4] - 2026-08-05
+
+### Fixed
+
+- **snapshots: create_snapshot silently fabricated success** (data-loss-adjacent).
+  The wrapper unconditionally returned `success: True` with a `datetime.now()`
+  timestamp even when the TrueNAS API call failed. Callers — including the
+  cutover-prep snapshot-before-migrate workflow — could not detect a failed
+  snapshot. The wrapper now inspects the TrueNAS response, returns
+  `success: False` on inline error payloads, surfaces the upstream `job_id`
+  on success so callers can verify the async job completed, and never
+  fabricates a creation timestamp. `create_snapshot_task` got the same
+  inline-error check.
+- **snapshots: list_snapshots raised TypeError on BSON timestamps.**
+  TrueNAS SCALE returns `properties.creation.parsed` as BSON extended JSON
+  (`{"$date": <epoch_ms>}`); the wrapper was passing that dict straight into
+  `datetime.fromtimestamp` and crashing the whole listing with
+  `'dict' object cannot be interpreted as an integer`. New
+  `_coerce_creation_timestamp` / `_parse_snapshot_timestamp` helpers unwrap
+  the BSON shape (and ISO strings) into epoch seconds. The sort key is now
+  robust to mixed timestamp shapes, and one bad row no longer kills the list.
+- **sharing: list_iscsi_targets crashed on mixed-shape records.**
+  TrueNAS SCALE 24.10 sometimes serialises `extent.filesize` as int, string,
+  or BSON extended JSON in the same response. The wrapper called
+  `format_size` with mixed types and crashed on the first bad row. `format_size`
+  now tolerates dict / str / None and returns `"unknown"` on unparseable
+  input. `list_iscsi_targets` additionally skips records with unhashable
+  extent ids (BSON ObjectIds) instead of crashing on `dict.__hash__`.
+
+### Changed
+
+- **tool_handler: classify exceptions.** TypeError, AttributeError, KeyError,
+  ValueError now surface as `error_type="WrapperBug"` (the TrueNAS API
+  returned something the wrapper didn't expect). httpx.* errors surface as
+  `error_type="TransportError"`. TrueNASError subclasses keep their specific
+  `error_type`. The decorator now also includes `exception_class`
+  (`module.ClassName`) on the failure response so triage can route to the
+  right component.
+
+### Added
+
+- **instances: list_instances surfaces 404 as EndpointNotAvailable.** When
+  the TrueNAS API returns 404 from `/virt/instance` (the Incus instance
+  surface was renamed/removed in some SCALE 24.10 releases), the wrapper now
+  returns a structured `error_type="EndpointNotAvailable"` with the endpoint
+  path and the upstream message, instead of the generic
+  `error_type="TrueNASAPIError"` the decorator previously produced. A 5xx
+  from the same endpoint still propagates as `TrueNASAPIError`.
+
+### Tests
+
+- New unit tests pin all four fixes down so they cannot regress:
+  `tests/unit/test_tools/test_snapshots.py`,
+  `tests/unit/test_tools/test_sharing.py`,
+  `tests/unit/test_tools/test_instances.py`. The existing
+  `tests/unit/test_tools/test_storage.py` pre-existing fixture issue
+  (`environment='testing'` not in the Settings enum) is unrelated and
+  out of scope.
+
 ## [4.0.0] - 2025-01-16
 
 ### Major Optimizations & Production Enhancements
